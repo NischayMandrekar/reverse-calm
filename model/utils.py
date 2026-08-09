@@ -58,9 +58,8 @@ def get_hidden_dims(
     connection: tuple[int, int],
 ) -> tuple[int, int]:
   """Gets the hidden dimensions for the given layers."""
-  anchor_layer, aug_layer = connection
-  anchor_hidden_dim = anchor_model.model.layers[anchor_layer].hidden_size
-  aug_hidden_dim = aug_model.model.layers[aug_layer].hidden_size
+  anchor_hidden_dim = anchor_model.config.hidden_size
+  aug_hidden_dim = aug_model.config.hidden_size
 
   return anchor_hidden_dim, aug_hidden_dim
 

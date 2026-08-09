@@ -88,7 +88,7 @@ class CALM(transformers.PreTrainedModel):
     """Returns the language model head."""
     return self.anchor_model.lm_head
 
-  def __init__(self, config: CALMConfig):
+  def __init__(self, config: CALMConfig, anchor_model_instance=None, aug_model_instance=None):
     """CALM implementation.
 
     Args:
@@ -119,14 +119,20 @@ class CALM(transformers.PreTrainedModel):
     if isinstance(config.aug_config, dict):
       config.aug_config = transformers.GemmaConfig.from_dict(config.aug_config)
 
-    self.anchor_model = transformers.AutoModelForCausalLM.from_pretrained(
-        config.anchor_model,
-        config=config.anchor_config,
-    )
-    self.aug_model = transformers.AutoModelForCausalLM.from_pretrained(
-        config.aug_model,
-        config=config.aug_config,
-    )
+    if anchor_model_instance is not None:
+      self.anchor_model = anchor_model_instance
+    else:
+      self.anchor_model = transformers.AutoModelForCausalLM.from_pretrained(
+          config.anchor_model,
+          config=config.anchor_config,
+      )
+    if aug_model_instance is not None:
+      self.aug_model = aug_model_instance
+    else:
+      self.aug_model = transformers.AutoModelForCausalLM.from_pretrained(
+          config.aug_model,
+          config=config.aug_config,
+      )
     self.vocab_size = self.anchor_model.config.vocab_size
     self.config = config
     self.num_anchor_layers = len(self.anchor_model.model.layers)
@@ -198,6 +204,8 @@ class CALM(transformers.PreTrainedModel):
       self,
       input_ids: torch.LongTensor = None,
       attention_mask: Optional[torch.Tensor] = None,
+      aug_input_ids: torch.LongTensor = None,
+      aug_attention_mask: Optional[torch.Tensor] = None,
       position_ids: Optional[torch.LongTensor] = None,
       past_key_values: Optional[
           Union[transformers.Cache, List[torch.FloatTensor]]
@@ -237,18 +245,25 @@ class CALM(transformers.PreTrainedModel):
 
     with torch.no_grad():
       self.aug_model.eval()
+      _aug_input_ids = aug_input_ids if aug_input_ids is not None else input_ids
+      _aug_attention_mask = aug_attention_mask if aug_attention_mask is not None else attention_mask
+      _position_ids = position_ids
+      if aug_input_ids is not None and aug_input_ids.shape[1] != input_ids.shape[1]:
+          _position_ids = _aug_attention_mask.long().cumsum(-1) - 1
+          _position_ids.masked_fill_(_aug_attention_mask == 0, 1)
+
       output = self.aug_model(
-          input_ids=input_ids,
-          attention_mask=attention_mask,
-          position_ids=position_ids,
-          past_key_values=past_key_values,
-          inputs_embeds=inputs_embeds,
+          input_ids=_aug_input_ids,
+          attention_mask=_aug_attention_mask,
+          position_ids=_position_ids,
+          past_key_values=None,
+          inputs_embeds=None,
           labels=labels,
-          use_cache=use_cache,
+          use_cache=False,
           output_attentions=output_attentions,
           output_hidden_states=output_hidden_states,
           return_dict=return_dict,
-          cache_position=cache_position,
+          cache_position=None,
       )
       for connection_idx, connection in enumerate(self.connections):
         aug_hidden_state = self.extract_hidden_state_hooks[
@@ -257,7 +272,7 @@ class CALM(transformers.PreTrainedModel):
         self.cross_attention_hooks[connection_idx].aug_hidden_state = (
             aug_hidden_state
         )
-        self.cross_attention_hooks[connection_idx].aug_mask = attention_mask
+        self.cross_attention_hooks[connection_idx].aug_mask = _aug_attention_mask
         del aug_hidden_state
     return output
 
@@ -265,6 +280,8 @@ class CALM(transformers.PreTrainedModel):
       self,
       input_ids: torch.LongTensor = None,
       attention_mask: Optional[torch.Tensor] = None,
+      aug_input_ids: torch.LongTensor = None,
+      aug_attention_mask: Optional[torch.Tensor] = None,
       position_ids: Optional[torch.LongTensor] = None,
       past_key_values: Optional[
           Union[transformers.Cache, List[torch.FloatTensor]]
@@ -312,6 +329,8 @@ class CALM(transformers.PreTrainedModel):
     aug_output = self._forward_aug(
         input_ids=input_ids,
         attention_mask=attention_mask,
+        aug_input_ids=aug_input_ids,
+        aug_attention_mask=aug_attention_mask,
         position_ids=position_ids,
         past_key_values=past_key_values,
         inputs_embeds=inputs_embeds,
@@ -491,6 +510,8 @@ class CALM(transformers.PreTrainedModel):
         "past_key_values": past_key_values,
         "use_cache": use_cache,
         "attention_mask": attention_mask,
+        "aug_input_ids": kwargs.get("aug_input_ids", None),
+        "aug_attention_mask": kwargs.get("aug_attention_mask", None),
     })
 
     return model_inputs

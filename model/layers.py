@@ -18,7 +18,7 @@
 from typing import Union
 
 import torch
-from transformers.models.gemma import modeling_gemma
+from transformers.models.qwen2 import modeling_qwen2
 
 
 def freeze_model(model):
@@ -89,7 +89,7 @@ class CrossAttentionHook(torch.nn.Module):
     self.proj = torch.nn.Linear(aug_hidden_dim, anchor_hidden_dim)
     self.embed_dim = anchor_hidden_dim
     self.num_heads = num_heads
-    self.post_attention_layernorm = modeling_gemma.GemmaRMSNorm(
+    self.post_attention_layernorm = modeling_qwen2.Qwen2RMSNorm(
         self.embed_dim, eps=rms_norm_eps
     )
     self.cross_attention = torch.nn.MultiheadAttention(
