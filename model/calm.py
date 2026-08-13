@@ -34,8 +34,8 @@ class CALMConfig(transformers.PretrainedConfig):
 
   def __init__(
       self,
-      anchor_model: str,
-      aug_model: str,
+      anchor_model: str = "nischay185/konkani-qwen2-1.5b",
+      aug_model: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
       anchor_config=None,
       aug_config=None,
       connections=None,
