@@ -1,12 +1,16 @@
 import os
 from typing import Callable, List, Optional, Tuple, Union
+
 from model import layers
 from model import utils
+
 import torch
 import transformers
 
+
 class CALMConfig(transformers.PretrainedConfig):
   model_type = "calm"
+
   def __init__(
       self,
       anchor_model: str = "google/gemma-2b",
@@ -25,84 +29,224 @@ class CALMConfig(transformers.PretrainedConfig):
     self.num_heads = num_heads
     self.anchor_config = anchor_config
     self.aug_config = aug_config
+
     super().__init__(**kwargs)
 
-class CALM(transformers.PreTrainedModel, transformers.GenerationMixin):
+
+class CALM(
+    transformers.PreTrainedModel,
+    transformers.GenerationMixin,
+):
   config_class = CALMConfig
 
   @property
   def lm_head(self):
     return self.anchor_model.lm_head
 
-  def __init__(self, config: CALMConfig, anchor_model_instance=None, aug_model_instance=None):
+  def __init__(
+      self,
+      config: CALMConfig,
+      anchor_model_instance=None,
+      aug_model_instance=None,
+  ):
     super().__init__(config)
+
+    # ---------------------------------------------------------
+    # Load configs.
+    # ---------------------------------------------------------
+
     if config.anchor_config is None:
-      config.anchor_config = transformers.AutoConfig.from_pretrained(config.anchor_model)
+      config.anchor_config = (
+          transformers.AutoConfig.from_pretrained(
+              config.anchor_model
+          )
+      )
+
     if config.aug_config is None:
-      config.aug_config = transformers.AutoConfig.from_pretrained(config.aug_model)
+      config.aug_config = (
+          transformers.AutoConfig.from_pretrained(
+              config.aug_model
+          )
+      )
+
+    # ---------------------------------------------------------
+    # Anchor model.
+    # ---------------------------------------------------------
 
     if anchor_model_instance is not None:
       self.anchor_model = anchor_model_instance
     else:
-      self.anchor_model = transformers.AutoModelForCausalLM.from_pretrained(config.anchor_model, config=config.anchor_config)
-    
+      self.anchor_model = (
+          transformers.AutoModelForCausalLM.from_pretrained(
+              config.anchor_model,
+              config=config.anchor_config,
+          )
+      )
+
+    # ---------------------------------------------------------
+    # Augmenting model.
+    # ---------------------------------------------------------
+
     if aug_model_instance is not None:
       self.aug_model = aug_model_instance
     else:
-      self.aug_model = transformers.AutoModelForCausalLM.from_pretrained(config.aug_model, config=config.aug_config)
+      self.aug_model = (
+          transformers.AutoModelForCausalLM.from_pretrained(
+              config.aug_model,
+              config=config.aug_config,
+          )
+      )
 
     self.vocab_size = self.anchor_model.config.vocab_size
     self.config = config
-    self.num_anchor_layers = len(self.anchor_model.model.layers)
-    self.num_aug_layers = len(self.aug_model.model.layers)
 
-    assert (config.connections is None) ^ (config.num_connections is None)
+    self.num_anchor_layers = len(
+        self.anchor_model.model.layers
+    )
+
+    self.num_aug_layers = len(
+        self.aug_model.model.layers
+    )
+
+    # Exactly one of these must be specified.
+    assert (
+        (config.connections is None)
+        ^ (config.num_connections is None)
+    )
+
+    # ---------------------------------------------------------
+    # Connections between anchor and augmenting layers.
+    # ---------------------------------------------------------
 
     if config.connections is not None:
       self.connections = config.connections
       self.num_connections = len(config.connections)
     else:
       self.num_connections = config.num_connections
-      self.connections = utils.get_connections(config.num_connections, self.num_anchor_layers, self.num_aug_layers)
+
+      self.connections = utils.get_connections(
+          config.num_connections,
+          self.num_anchor_layers,
+          self.num_aug_layers,
+      )
+
+    # ---------------------------------------------------------
+    # Hooks to extract augmenting hidden states.
+    # ---------------------------------------------------------
 
     self.extract_hidden_state_hooks = {}
+
     for connection in self.connections:
       aug_connection_idx = connection[1]
+
       hook = layers.ExtractHiddenStateHook()
-      self.extract_hidden_state_hooks[tuple(connection)] = hook
-      self.aug_model.model.layers[aug_connection_idx].register_forward_hook(hook)
+
+      self.extract_hidden_state_hooks[
+          tuple(connection)
+      ] = hook
+
+      self.aug_model.model.layers[
+          aug_connection_idx
+      ].register_forward_hook(hook)
+
+    # ---------------------------------------------------------
+    # Determine hidden dimensions.
+    # ---------------------------------------------------------
 
     self.connection_hidden_dims = []
+
     for connection in self.connections:
-      anchor_hidden_dim, aug_hidden_dim = utils.get_hidden_dims(self.anchor_model, self.aug_model, tuple(connection))
-      self.connection_hidden_dims.append((anchor_hidden_dim, aug_hidden_dim))
+      anchor_hidden_dim, aug_hidden_dim = (
+          utils.get_hidden_dims(
+              self.anchor_model,
+              self.aug_model,
+              tuple(connection),
+          )
+      )
+
+      self.connection_hidden_dims.append(
+          (anchor_hidden_dim, aug_hidden_dim)
+      )
+
+    # ---------------------------------------------------------
+    # Trainable bridge modules.
+    # ---------------------------------------------------------
 
     self.cross_attention_hooks = torch.nn.ModuleList([])
-    for _, connection_hidden_dim in zip(self.connections, self.connection_hidden_dims):
+
+    for _, connection_hidden_dim in zip(
+        self.connections,
+        self.connection_hidden_dims,
+    ):
+      anchor_hidden_dim, aug_hidden_dim = (
+          connection_hidden_dim
+      )
+
       self.cross_attention_hooks.append(
-    layers.CrossAttentionHook(
-        anchor_hidden_dim=connection_hidden_dim[0],
-        aug_hidden_dim=connection_hidden_dim[1],
-        num_heads=config.num_heads,
-        rms_norm_eps=self.anchor_model.config.rms_norm_eps,
-    )
-)
+          layers.CrossAttentionHook(
+              anchor_hidden_dim=anchor_hidden_dim,
+              aug_hidden_dim=aug_hidden_dim,
+              num_heads=config.num_heads,
+              rms_norm_eps=self.anchor_model.config.rms_norm_eps,
+          )
+      )
+
+    # ---------------------------------------------------------
+    # Freeze both base models.
+    # Only bridge parameters remain trainable.
+    # ---------------------------------------------------------
 
     layers.freeze_model(self.anchor_model)
     layers.freeze_model(self.aug_model)
 
-    for connection_idx, connection in enumerate(self.connections):
+    # ---------------------------------------------------------
+    # Register cross-attention hooks on anchor layers.
+    # ---------------------------------------------------------
+
+    for connection_idx, connection in enumerate(
+        self.connections
+    ):
       connection_anchor_layer_idx = connection[0]
-      layer = self.anchor_model.model.layers[connection_anchor_layer_idx]
-      layer.register_forward_hook(self.cross_attention_hooks[connection_idx])
+
+      layer = self.anchor_model.model.layers[
+          connection_anchor_layer_idx
+      ]
+
+      layer.register_forward_hook(
+          self.cross_attention_hooks[
+              connection_idx
+          ]
+      )
 
   def release_memory(self):
-    for cross_attention_hook in self.cross_attention_hooks:
+    """Release cached runtime hidden states."""
+
+    for cross_attention_hook in (
+        self.cross_attention_hooks
+    ):
       cross_attention_hook.aug_hidden_state = None
       cross_attention_hook.aug_mask = None
       cross_attention_hook.attn_weights = None
-    for extract_hidden_state_hook in self.extract_hidden_state_hooks.values():
+
+    for extract_hidden_state_hook in (
+        self.extract_hidden_state_hooks.values()
+    ):
       extract_hidden_state_hook.hidden_state = None
+
+  def _clear_bridge_state(self):
+    """Clear stale augmenting states before a new forward."""
+
+    for connection in self.connections:
+      hook = self.extract_hidden_state_hooks[
+          tuple(connection)
+      ]
+
+      hook.hidden_state = None
+
+    for cross_hook in self.cross_attention_hooks:
+      cross_hook.aug_hidden_state = None
+      cross_hook.aug_mask = None
+      cross_hook.attn_weights = None
 
   def _forward_aug(
       self,
@@ -120,11 +264,25 @@ class CALM(transformers.PreTrainedModel, transformers.GenerationMixin):
       return_dict=None,
       cache_position=None,
   ):
+    """
+    Forward pass through the frozen augmenting model.
+
+    The augmenting model receives aug_input_ids, which in our
+    pipeline is the English translation of the Konkani input.
+    """
+
     with torch.no_grad():
+
       self.aug_model.eval()
 
+      # -------------------------------------------------------
+      # Select augmenting input.
+      # -------------------------------------------------------
+
       _aug_input_ids = (
-          aug_input_ids if aug_input_ids is not None else input_ids
+          aug_input_ids
+          if aug_input_ids is not None
+          else input_ids
       )
 
       _aug_attention_mask = (
@@ -133,32 +291,53 @@ class CALM(transformers.PreTrainedModel, transformers.GenerationMixin):
           else attention_mask
       )
 
+      if _aug_input_ids is None:
+        raise ValueError(
+            "No input was provided to the augmenting model."
+        )
+
+      if _aug_attention_mask is None:
+        raise ValueError(
+            "No attention mask was provided to the augmenting model."
+        )
+
+      # -------------------------------------------------------
+      # Position IDs.
+      #
+      # Anchor and augmenting sequences can have different
+      # lengths.
+      # -------------------------------------------------------
+
       _position_ids = position_ids
 
-      # Translation/English input can have a different sequence length
-      # from the Konkani anchor input.
       if (
           aug_input_ids is not None
           and input_ids is not None
-          and aug_input_ids.shape[1] != input_ids.shape[1]
+          and aug_input_ids.shape[1]
+          != input_ids.shape[1]
       ):
-        _position_ids = _aug_attention_mask.long().cumsum(-1) - 1
+        _position_ids = (
+            _aug_attention_mask.long()
+            .cumsum(-1)
+            - 1
+        )
+
         _position_ids.masked_fill_(
             _aug_attention_mask == 0,
             1,
         )
 
-      # Clear previous bridge states BEFORE running augmenting model.
-      for connection in self.connections:
-        hook = self.extract_hidden_state_hooks[tuple(connection)]
-        hook.hidden_state = None
+      # -------------------------------------------------------
+      # CRITICAL:
+      # Remove stale states from previous batch.
+      # -------------------------------------------------------
 
-      for cross_hook in self.cross_attention_hooks:
-        cross_hook.aug_hidden_state = None
-        cross_hook.aug_mask = None
-        cross_hook.attn_weights = None
+      self._clear_bridge_state()
 
-      # Run augmenting model.
+      # -------------------------------------------------------
+      # Run frozen augmenting model.
+      # -------------------------------------------------------
+
       output = self.aug_model(
           input_ids=_aug_input_ids,
           attention_mask=_aug_attention_mask,
@@ -166,76 +345,284 @@ class CALM(transformers.PreTrainedModel, transformers.GenerationMixin):
           use_cache=False,
       )
 
-      # Capture the NEW hidden states from this forward pass.
-      for connection_idx, connection in enumerate(self.connections):
+      # -------------------------------------------------------
+      # Transfer freshly extracted hidden states to bridges.
+      # -------------------------------------------------------
 
+      for connection_idx, connection in enumerate(
+          self.connections
+      ):
         extract_hook = self.extract_hidden_state_hooks[
             tuple(connection)
         ]
 
-        aug_hidden_state = extract_hook.hidden_state
+        aug_hidden_state = (
+            extract_hook.hidden_state
+        )
 
         if aug_hidden_state is None:
           raise RuntimeError(
-              f"Augmenting hidden state was not captured for "
-              f"connection {connection}."
+              "Augmenting hidden state was not captured "
+              f"for connection {connection}."
           )
 
-        # Important sanity check:
-        # hidden-state batch must equal current augmenting input batch.
-        if aug_hidden_state.shape[0] != _aug_input_ids.shape[0]:
+        # -----------------------------------------------------
+        # Batch consistency check.
+        # -----------------------------------------------------
+
+        if (
+            aug_hidden_state.shape[0]
+            != _aug_input_ids.shape[0]
+        ):
           raise RuntimeError(
-              "STALE AUG HIDDEN STATE: "
+              "AUGMENTING BATCH MISMATCH: "
               f"connection={connection}, "
-              f"hidden_state={aug_hidden_state.shape}, "
-              f"aug_input_ids={_aug_input_ids.shape}"
+              f"hidden_state="
+              f"{tuple(aug_hidden_state.shape)}, "
+              f"input_ids="
+              f"{tuple(_aug_input_ids.shape)}"
           )
 
-        self.cross_attention_hooks[
-            connection_idx
-        ].aug_hidden_state = aug_hidden_state
+        # -----------------------------------------------------
+        # Sequence consistency check.
+        # -----------------------------------------------------
 
-        self.cross_attention_hooks[
-            connection_idx
-        ].aug_mask = _aug_attention_mask
+        if (
+            aug_hidden_state.shape[1]
+            != _aug_input_ids.shape[1]
+        ):
+          raise RuntimeError(
+              "AUGMENTING SEQUENCE MISMATCH: "
+              f"connection={connection}, "
+              f"hidden_state="
+              f"{tuple(aug_hidden_state.shape)}, "
+              f"input_ids="
+              f"{tuple(_aug_input_ids.shape)}"
+          )
+
+        cross_hook = (
+            self.cross_attention_hooks[
+                connection_idx
+            ]
+        )
+
+        cross_hook.aug_hidden_state = (
+            aug_hidden_state
+        )
+
+        cross_hook.aug_mask = (
+            _aug_attention_mask
+        )
 
       return output
-    
 
-  def save_pretrained(self, save_directory, **kwargs):
-    super().save_pretrained(save_directory, safe_serialization=False, **kwargs)
+  def forward(
+      self,
+      input_ids=None,
+      attention_mask=None,
+      aug_input_ids=None,
+      aug_attention_mask=None,
+      position_ids=None,
+      past_key_values=None,
+      inputs_embeds=None,
+      labels=None,
+      use_cache=True,
+      output_attentions=None,
+      output_hidden_states=None,
+      return_dict=None,
+      cache_position=None,
+  ):
+    """
+    CALM forward pass.
 
-  def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, cache_position=None, use_cache=True, **kwargs):
+    1. Run augmenting model.
+    2. Capture augmenting hidden states.
+    3. Run anchor model.
+    4. Cross-attention hooks inject augmenting information.
+    5. Anchor LM head produces final logits/loss.
+    """
+
+    # ---------------------------------------------------------
+    # Step 1:
+    # Frozen augmenting model.
+    # ---------------------------------------------------------
+
+    aug_output = self._forward_aug(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        aug_input_ids=aug_input_ids,
+        aug_attention_mask=aug_attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        labels=labels,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+        cache_position=cache_position,
+    )
+
+    del aug_output
+
+    # ---------------------------------------------------------
+    # Step 2:
+    # Anchor model.
+    #
+    # CrossAttentionHooks fire automatically at the selected
+    # anchor layers.
+    # ---------------------------------------------------------
+
+    output = self.anchor_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        labels=labels,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+        cache_position=cache_position,
+    )
+
+    return output
+
+  def save_pretrained(
+      self,
+      save_directory,
+      **kwargs,
+  ):
+    super().save_pretrained(
+        save_directory,
+        safe_serialization=False,
+        **kwargs,
+    )
+
+  def prepare_inputs_for_generation(
+      self,
+      input_ids,
+      past_key_values=None,
+      attention_mask=None,
+      inputs_embeds=None,
+      cache_position=None,
+      use_cache=True,
+      **kwargs,
+  ):
+    """
+    Prepare inputs for anchor generation while preserving
+    augmenting-model inputs.
+    """
+
     past_length = 0
+
     if past_key_values is not None:
-      if isinstance(past_key_values, transformers.Cache):
-        past_length = cache_position[0] if cache_position is not None else past_key_values.get_seq_length()
+
+      if isinstance(
+          past_key_values,
+          transformers.Cache,
+      ):
+        past_length = (
+            cache_position[0]
+            if cache_position is not None
+            else past_key_values.get_seq_length()
+        )
+
       else:
-        past_length = past_key_values[0][0].shape[2]
-      if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-        input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+        past_length = (
+            past_key_values[0][0].shape[2]
+        )
+
+      if (
+          attention_mask is not None
+          and attention_mask.shape[1]
+          > input_ids.shape[1]
+      ):
+        input_ids = input_ids[
+            :,
+            -(
+                attention_mask.shape[1]
+                - past_length
+            ):,
+        ]
+
       elif past_length < input_ids.shape[1]:
-        input_ids = input_ids[:, past_length:]
+        input_ids = input_ids[
+            :,
+            past_length:,
+        ]
 
-    position_ids = kwargs.get("position_ids", None)
-    if attention_mask is not None and position_ids is None:
-      position_ids = attention_mask.long().cumsum(-1) - 1
-      position_ids.masked_fill_(attention_mask == 0, 1)
+    # ---------------------------------------------------------
+    # Anchor position IDs.
+    # ---------------------------------------------------------
 
-    model_inputs = {"input_ids": input_ids.contiguous()}
-    input_length = position_ids.shape[-1] if position_ids is not None else input_ids.shape[-1]
+    position_ids = kwargs.get(
+        "position_ids",
+        None,
+    )
+
+    if (
+        attention_mask is not None
+        and position_ids is None
+    ):
+      position_ids = (
+          attention_mask.long()
+          .cumsum(-1)
+          - 1
+      )
+
+      position_ids.masked_fill_(
+          attention_mask == 0,
+          1,
+      )
+
+    # ---------------------------------------------------------
+    # Cache position.
+    # ---------------------------------------------------------
+
+    model_inputs = {
+        "input_ids": input_ids.contiguous(),
+    }
+
+    input_length = (
+        position_ids.shape[-1]
+        if position_ids is not None
+        else input_ids.shape[-1]
+    )
+
     if cache_position is None:
-      cache_position = torch.arange(past_length, past_length + input_length, device=input_ids.device)
-    elif use_cache:
-      cache_position = cache_position[-input_length:]
+      cache_position = torch.arange(
+          past_length,
+          past_length + input_length,
+          device=input_ids.device,
+      )
 
-    model_inputs.update({
-        "position_ids": position_ids,
-        "cache_position": cache_position,
-        "past_key_values": past_key_values,
-        "use_cache": use_cache,
-        "attention_mask": attention_mask,
-        "aug_input_ids": kwargs.get("aug_input_ids", None),
-        "aug_attention_mask": kwargs.get("aug_attention_mask", None),
-    })
+    elif use_cache:
+      cache_position = cache_position[
+          -input_length:
+      ]
+
+    # ---------------------------------------------------------
+    # Preserve augmenting inputs.
+    # ---------------------------------------------------------
+
+    model_inputs.update(
+        {
+            "position_ids": position_ids,
+            "cache_position": cache_position,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+            "attention_mask": attention_mask,
+            "aug_input_ids": kwargs.get(
+                "aug_input_ids",
+                None,
+            ),
+            "aug_attention_mask": kwargs.get(
+                "aug_attention_mask",
+                None,
+            ),
+        }
+    )
+
     return model_inputs

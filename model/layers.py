@@ -33,13 +33,15 @@ def process_hook_args(
     out: Union[torch.Tensor, tuple[torch.Tensor, ...]],
 ):
   """Extracts the main output tensor from a PyTorch hook output."""
+
   anchor_hidden_state = out[0] if isinstance(out, tuple) else out
   query = anchor_hidden_state
+
   return query, out
 
 
 class CrossAttentionHook(torch.nn.Module):
-  """Cross attention hook for CALM."""
+  """Cross-attention bridge between augmenting and anchor models."""
 
   def __init__(
       self,
@@ -60,23 +62,25 @@ class CrossAttentionHook(torch.nn.Module):
     self.num_heads = num_heads
     self.head_dim = anchor_hidden_dim // num_heads
 
-    # Augmenting model -> Key / Value
+    # Augmenting model -> K
     self.k_proj = torch.nn.Linear(
         aug_hidden_dim,
         anchor_hidden_dim,
     )
+
+    # Augmenting model -> V
     self.v_proj = torch.nn.Linear(
         aug_hidden_dim,
         anchor_hidden_dim,
     )
 
-    # Anchor model -> Query
+    # Anchor model -> Q
     self.q_proj = torch.nn.Linear(
         anchor_hidden_dim,
         anchor_hidden_dim,
     )
 
-    # Final attention output projection
+    # Attention output projection.
     self.out_proj = torch.nn.Linear(
         anchor_hidden_dim,
         anchor_hidden_dim,
@@ -87,13 +91,29 @@ class CrossAttentionHook(torch.nn.Module):
         eps=rms_norm_eps,
     )
 
+    # Runtime state populated by CALM._forward_aug().
     self.aug_hidden_state = None
     self.aug_mask = None
     self.attn_weights = None
 
   def _reshape_heads(self, x):
-    """Convert [B, S, D] into [B, H, S, Dh]."""
-    batch_size, seq_len, _ = x.shape
+    """
+    Convert:
+
+        [B, S, D]
+
+    into:
+
+        [B, H, S, Dh]
+    """
+
+    batch_size, seq_len, hidden_dim = x.shape
+
+    if hidden_dim != self.embed_dim:
+      raise RuntimeError(
+          "Unexpected hidden dimension in cross-attention: "
+          f"got {hidden_dim}, expected {self.embed_dim}"
+      )
 
     x = x.view(
         batch_size,
@@ -107,22 +127,29 @@ class CrossAttentionHook(torch.nn.Module):
   def forward(self, *hook_args):
     query, output = process_hook_args(*hook_args)
 
-    assert self.aug_hidden_state is not None
-    assert self.aug_mask is not None
+    if self.aug_hidden_state is None:
+      raise RuntimeError(
+          "CrossAttentionHook received no augmenting hidden state."
+      )
+
+    if self.aug_mask is None:
+      raise RuntimeError(
+          "CrossAttentionHook received no augmenting attention mask."
+      )
 
     # ---------------------------------------------------------
-    # Preserve the anchor model's dtype at the interface.
-    # Bridge computation itself is performed in float32.
+    # Save the dtype expected by the frozen anchor transformer.
     # ---------------------------------------------------------
 
     anchor_dtype = query.dtype
 
+    # Bridge calculations are performed in FP32.
     query_float = query.float()
     aug_hidden_float = self.aug_hidden_state.float()
 
     # ---------------------------------------------------------
-    # Q from anchor
-    # K/V from augmenting model
+    # Q from anchor.
+    # K/V from augmenting model.
     # ---------------------------------------------------------
 
     q = self.q_proj(query_float)
@@ -130,7 +157,11 @@ class CrossAttentionHook(torch.nn.Module):
     v = self.v_proj(aug_hidden_float)
 
     # ---------------------------------------------------------
-    # [B, S, D] -> [B, H, S, Dh]
+    # Shape:
+    #
+    # Q: [B, H, S_anchor, Dh]
+    # K: [B, H, S_aug,    Dh]
+    # V: [B, H, S_aug,    Dh]
     # ---------------------------------------------------------
 
     q = self._reshape_heads(q)
@@ -138,7 +169,15 @@ class CrossAttentionHook(torch.nn.Module):
     v = self._reshape_heads(v)
 
     # ---------------------------------------------------------
-    # Scaled dot-product attention
+    # Scaled dot-product attention.
+    #
+    # [B,H,S_anchor,Dh]
+    # ×
+    # [B,H,Dh,S_aug]
+    #
+    # =
+    #
+    # [B,H,S_anchor,S_aug]
     # ---------------------------------------------------------
 
     scale = self.head_dim ** -0.5
@@ -149,10 +188,12 @@ class CrossAttentionHook(torch.nn.Module):
     ) * scale
 
     # ---------------------------------------------------------
-    # Augmenting attention mask
+    # Apply augmenting-model padding mask.
     #
+    # aug_mask:
     # [B, S_aug]
-    # ->
+    #
+    # becomes:
     # [B, 1, 1, S_aug]
     # ---------------------------------------------------------
 
@@ -160,6 +201,26 @@ class CrossAttentionHook(torch.nn.Module):
         device=attention_scores.device,
         dtype=torch.bool,
     )
+
+    if aug_mask.dim() != 2:
+      raise RuntimeError(
+          "Expected augmenting attention mask to have shape [B, S]. "
+          f"Got {aug_mask.shape}."
+      )
+
+    if aug_mask.shape[0] != attention_scores.shape[0]:
+      raise RuntimeError(
+          "Cross-attention batch mismatch: "
+          f"query batch={attention_scores.shape[0]}, "
+          f"mask batch={aug_mask.shape[0]}."
+      )
+
+    if aug_mask.shape[1] != attention_scores.shape[-1]:
+      raise RuntimeError(
+          "Cross-attention sequence mismatch: "
+          f"key sequence={attention_scores.shape[-1]}, "
+          f"mask sequence={aug_mask.shape[1]}."
+      )
 
     attention_scores = attention_scores.masked_fill(
         ~aug_mask[:, None, None, :],
@@ -174,16 +235,27 @@ class CrossAttentionHook(torch.nn.Module):
     self.attn_weights = attention_weights.detach()
 
     # ---------------------------------------------------------
-    # Attention output
-    # [B, H, S_anchor, Dh]
-    # ->
-    # [B, S_anchor, D]
+    # Weighted V.
+    #
+    # [B,H,S_anchor,S_aug]
+    # ×
+    # [B,H,S_aug,Dh]
+    #
+    # =
+    #
+    # [B,H,S_anchor,Dh]
     # ---------------------------------------------------------
 
     attn_output = torch.matmul(
         attention_weights,
         v,
     )
+
+    # ---------------------------------------------------------
+    # [B,H,S,Dh]
+    # ->
+    # [B,S,D]
+    # ---------------------------------------------------------
 
     attn_output = (
         attn_output
@@ -200,14 +272,14 @@ class CrossAttentionHook(torch.nn.Module):
     )
 
     # ---------------------------------------------------------
-    # Output projection
+    # Output projection.
     # ---------------------------------------------------------
 
     attn_output = self.out_proj(attn_output)
 
     # ---------------------------------------------------------
-    # Return to anchor dtype BEFORE entering the frozen
-    # Qwen transformer again.
+    # Convert back to anchor dtype before returning through
+    # the anchor transformer.
     # ---------------------------------------------------------
 
     attn_output = attn_output.to(anchor_dtype)
@@ -218,17 +290,20 @@ class CrossAttentionHook(torch.nn.Module):
 
     attn_output = attn_output.to(anchor_dtype)
 
-    query = query.to(anchor_dtype)
-
     # ---------------------------------------------------------
-    # Residual connection
+    # Residual connection.
+    #
+    # Anchor hidden
+    #       +
+    # Cross-attention information
     # ---------------------------------------------------------
 
-    output_fin = attn_output + query
+    output_fin = query + attn_output
 
     # Final safety cast.
     output_fin = output_fin.to(anchor_dtype)
 
+    # Decoder layer outputs are tuples.
     new_output = (output_fin,) + output[1:]
 
     return new_output
@@ -239,9 +314,14 @@ class ExtractHiddenStateHook(torch.nn.Module):
 
   def __init__(self):
     super().__init__()
+
     self.hidden_state = None
 
   def forward(self, *hook_args):
-    hidden_state, out = process_hook_args(*hook_args)
+    hidden_state, out = process_hook_args(
+        *hook_args
+    )
+
     self.hidden_state = hidden_state
+
     return out
