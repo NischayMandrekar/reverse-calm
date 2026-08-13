@@ -104,61 +104,103 @@ class CALM(transformers.PreTrainedModel, transformers.GenerationMixin):
     for extract_hidden_state_hook in self.extract_hidden_state_hooks.values():
       extract_hidden_state_hook.hidden_state = None
 
-  def _forward_aug(self, input_ids=None, attention_mask=None, aug_input_ids=None, aug_attention_mask=None, position_ids=None, past_key_values=None, inputs_embeds=None, labels=None, use_cache=True, output_attentions=None, output_hidden_states=None, return_dict=None, cache_position=None):
+  def _forward_aug(
+      self,
+      input_ids=None,
+      attention_mask=None,
+      aug_input_ids=None,
+      aug_attention_mask=None,
+      position_ids=None,
+      past_key_values=None,
+      inputs_embeds=None,
+      labels=None,
+      use_cache=True,
+      output_attentions=None,
+      output_hidden_states=None,
+      return_dict=None,
+      cache_position=None,
+  ):
     with torch.no_grad():
       self.aug_model.eval()
-      _aug_input_ids = aug_input_ids if aug_input_ids is not None else input_ids
-      _aug_attention_mask = aug_attention_mask if aug_attention_mask is not None else attention_mask
-      _position_ids = position_ids
-      if aug_input_ids is not None and aug_input_ids.shape[1] != input_ids.shape[1]:
-          _position_ids = _aug_attention_mask.long().cumsum(-1) - 1
-          _position_ids.masked_fill_(_aug_attention_mask == 0, 1)
 
+      _aug_input_ids = (
+          aug_input_ids if aug_input_ids is not None else input_ids
+      )
+
+      _aug_attention_mask = (
+          aug_attention_mask
+          if aug_attention_mask is not None
+          else attention_mask
+      )
+
+      _position_ids = position_ids
+
+      # Translation/English input can have a different sequence length
+      # from the Konkani anchor input.
+      if (
+          aug_input_ids is not None
+          and input_ids is not None
+          and aug_input_ids.shape[1] != input_ids.shape[1]
+      ):
+        _position_ids = _aug_attention_mask.long().cumsum(-1) - 1
+        _position_ids.masked_fill_(
+            _aug_attention_mask == 0,
+            1,
+        )
+
+      # Clear previous bridge states BEFORE running augmenting model.
+      for connection in self.connections:
+        hook = self.extract_hidden_state_hooks[tuple(connection)]
+        hook.hidden_state = None
+
+      for cross_hook in self.cross_attention_hooks:
+        cross_hook.aug_hidden_state = None
+        cross_hook.aug_mask = None
+        cross_hook.attn_weights = None
+
+      # Run augmenting model.
       output = self.aug_model(
           input_ids=_aug_input_ids,
           attention_mask=_aug_attention_mask,
           position_ids=_position_ids,
           use_cache=False,
       )
+
+      # Capture the NEW hidden states from this forward pass.
       for connection_idx, connection in enumerate(self.connections):
-        aug_hidden_state = self.extract_hidden_state_hooks[tuple(connection)].hidden_state
-        self.cross_attention_hooks[connection_idx].aug_hidden_state = aug_hidden_state
-        self.cross_attention_hooks[connection_idx].aug_mask = _aug_attention_mask
-        del aug_hidden_state
-    return output
 
-  def forward(self, input_ids=None, attention_mask=None, aug_input_ids=None, aug_attention_mask=None, position_ids=None, past_key_values=None, inputs_embeds=None, labels=None, use_cache=True, output_attentions=None, output_hidden_states=None, return_dict=None, cache_position=None):
-    aug_output = self._forward_aug(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        aug_input_ids=aug_input_ids,
-        aug_attention_mask=aug_attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        labels=labels,
-        use_cache=use_cache,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
-        return_dict=return_dict,
-        cache_position=cache_position,
-    )
-    del aug_output
+        extract_hook = self.extract_hidden_state_hooks[
+            tuple(connection)
+        ]
 
-    output = self.anchor_model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        labels=labels,
-        use_cache=use_cache,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
-        return_dict=return_dict,
-        cache_position=cache_position,
-    )
-    return output
+        aug_hidden_state = extract_hook.hidden_state
+
+        if aug_hidden_state is None:
+          raise RuntimeError(
+              f"Augmenting hidden state was not captured for "
+              f"connection {connection}."
+          )
+
+        # Important sanity check:
+        # hidden-state batch must equal current augmenting input batch.
+        if aug_hidden_state.shape[0] != _aug_input_ids.shape[0]:
+          raise RuntimeError(
+              "STALE AUG HIDDEN STATE: "
+              f"connection={connection}, "
+              f"hidden_state={aug_hidden_state.shape}, "
+              f"aug_input_ids={_aug_input_ids.shape}"
+          )
+
+        self.cross_attention_hooks[
+            connection_idx
+        ].aug_hidden_state = aug_hidden_state
+
+        self.cross_attention_hooks[
+            connection_idx
+        ].aug_mask = _aug_attention_mask
+
+      return output
+    
 
   def save_pretrained(self, save_directory, **kwargs):
     super().save_pretrained(save_directory, safe_serialization=False, **kwargs)
