@@ -80,13 +80,13 @@ class CALM(transformers.PreTrainedModel):
     self.cross_attention_hooks = torch.nn.ModuleList([])
     for _, connection_hidden_dim in zip(self.connections, self.connection_hidden_dims):
       self.cross_attention_hooks.append(
-          layers.CrossAttentionHook(
-              anchor_hidden_dim=connection_hidden_dim[0],
-              aug_hidden_dim=connection_hidden_dim[1],
-              num_heads=config.num_heads,
-              rms_norm_eps=self.anchor_model.config.rms_norm_eps,
-          )
-      )
+    layers.CrossAttentionHook(
+        anchor_hidden_dim=connection_hidden_dim[0],
+        aug_hidden_dim=connection_hidden_dim[1],
+        num_heads=config.num_heads,
+        rms_norm_eps=self.anchor_model.config.rms_norm_eps,
+    )
+)
 
     layers.freeze_model(self.anchor_model)
     layers.freeze_model(self.aug_model)
