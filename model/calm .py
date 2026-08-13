@@ -27,7 +27,7 @@ class CALMConfig(transformers.PretrainedConfig):
     self.aug_config = aug_config
     super().__init__(**kwargs)
 
-class CALM(transformers.PreTrainedModel):
+class CALM(transformers.PreTrainedModel, transformers.GenerationMixin):
   config_class = CALMConfig
 
   @property
