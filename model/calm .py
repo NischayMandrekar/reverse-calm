@@ -85,7 +85,6 @@ class CALM(transformers.PreTrainedModel):
               aug_hidden_dim=connection_hidden_dim[1],
               num_heads=config.num_heads,
               rms_norm_eps=self.anchor_model.config.rms_norm_eps,
-              torch_dtype=self.anchor_model.dtype,
           )
       )
 
